@@ -5,7 +5,7 @@
     photoimporter.py
     ---------------------
     Date                 : November 2014
-    Copyright            : (C) 2010-2018 by Alexander Bruy
+    Copyright            : (C) 2010-2017 by Alexander Bruy
     Email                : alexander dot bruy at gmail dot com
 ***************************************************************************
 *                                                                         *
@@ -19,7 +19,7 @@
 
 __author__ = 'Alexander Bruy'
 __date__ = 'November 2014'
-__copyright__ = '(C) 2010-2018, Alexander Bruy'
+__copyright__ = '(C) 2010-2017, Alexander Bruy'
 
 # This will get replaced with a git SHA1 when you do a git archive
 
@@ -29,9 +29,9 @@ import os
 
 import exifread
 
-from qgis.PyQt.QtCore import pyqtSignal, QObject, QVariant
+from qgis.PyQt.QtCore import pyqtSignal, QObject, QVariant, QFileInfo
 
-from qgis.core import (QgsWkbTypes,
+from qgis.core import (QGis,
                        QgsFeature,
                        QgsFields,
                        QgsField,
@@ -57,7 +57,6 @@ class PhotoImporter(QObject):
 
     def setOutputPath(self, filePath):
         self.shapePath = filePath
-        self.fileName = os.path.splitext(os.path.basename(filePath))[0]
 
     def setEncoding(self, encoding):
         self.encoding = encoding
@@ -69,27 +68,33 @@ class PhotoImporter(QObject):
         self.append = append
 
     def importPhotos(self):
+        if exifread.__version__ == '2.0.0':
+            self.importError.emit(
+                self.tr('Found exifread {}, but plugin requires exifread '
+                        '1.x or >= 2.0.1.'.format(exifread.__version__)))
+            return
+
         if self.append:
             layer = self._openShapefile()
         else:
             layer = self._newShapefile()
 
         if layer is None:
-            self.importError.emit(self.tr("Unable to open or create layer."))
+            self.importError.emit(self.tr('Unable to open or create layer.'))
             return
 
         provider = layer.dataProvider()
-        fields = layer.fields()
+        fields = layer.pendingFields()
 
         photos = []
         for root, dirs, files in os.walk(self.directory):
             photos.extend(os.path.join(root, fName) for fName in files
-                          if fName.lower().endswith((".jpg", ".jpeg")))
+                          if fName.lower().endswith(('.jpg', '.jpeg')))
             if not self.recurse:
                 break
 
         if len(photos) == 0:
-            self.importError.emit(self.tr("No images found in the directory."))
+            self.importError.emit(self.tr('No images found in directory.'))
             return
 
         total = 100.0 / len(photos)
@@ -97,13 +102,13 @@ class PhotoImporter(QObject):
         ft = QgsFeature()
         ft.setFields(fields)
         for count, fName in enumerate(photos):
-            with open(fName, "rb") as imgFile:
-                tags = exifread.process_file(imgFile, details=False)
+            with open(fName, 'rb') as imgFile:
+                tags = exifread.process_file(imgFile)
 
-            if not tags.keys() & {"GPS GPSLongitude", "GPS GPSLatitude"}:
+            if not tags.viewkeys() & {'GPS GPSLongitude', 'GPS GPSLatitude'}:
                 self.importMessage.emit(
-                    self.tr("Skipping file {}: "
-                            "there are no GPS tags in it.".format(fName)))
+                    self.tr('Skipping file {}: '
+                            'there are no GPS tags in it.'.format(fName)))
                 self.photoProcessed.emit(int(count * total))
                 continue
 
@@ -111,8 +116,8 @@ class PhotoImporter(QObject):
             longitude, latitude = self._extractCoordinates(tags)
             if longitude is None:
                 self.importMessage.emit(
-                    self.tr("Skipping file {}: "
-                            "there are no GPS fix data.".format(fName)))
+                    self.tr('Skipping file {}: '
+                            'there are no GPS fix data.'.format(fName)))
                 self.photoProcessed.emit(int(count * total))
                 continue
 
@@ -120,82 +125,82 @@ class PhotoImporter(QObject):
             north, azimuth = self._extractDirection(tags)
             gpsDate = self._extracrGPSDateTime(tags)
             imgDate = self._extractImageDateTime(tags)
+            userLabel = self._extractUserComment(tags)
             del tags
 
             # Write feature to layer
-            z = altitude if altitude is not None else 0.0
-            ft.setGeometry(QgsGeometry(QgsPoint(longitude, latitude, z)))
-            ft["filepath"] = fName
-            ft["longitude"] = longitude
-            ft["latitude"] = latitude
-            ft["altitude"] = altitude
-            ft["north"] = north
-            ft["azimuth"] = azimuth
-            ft["gps_date"] = gpsDate
-            ft["img_date"] = imgDate
+            ft.setGeometry(
+                QgsGeometry.fromPoint(QgsPoint(longitude, latitude)))
+            ft['filepath'] = fName
+            ft['filename'] = os.path.basename(fName)
+            ft['longitude'] = longitude
+            ft['latitude'] = latitude
+            ft['altitude'] = altitude
+            ft['north'] = north
+            ft['azimuth'] = azimuth
+            ft['gpsDate'] = gpsDate
+            ft['imgDate'] = imgDate
+            ft['userLabel'] = userLabel
             provider.addFeatures([ft])
             self.photoProcessed.emit(int(count * total))
 
         self.importFinished.emit()
 
     def _openShapefile(self):
-        layer = QgsVectorLayer(self.shapePath, self.fileName, "ogr")
-
-        wkbType = layer.wkbType()
-        if wkbType != QgsWkbTypes.PointZ:
-            self.importError.emit(
-                self.tr("File has incorrect WKB type '{}'. Please select layer "
-                        "with 'PointZ' WKB type.".format(QgsWkbTypes.displayString(wkbType))))
-            return None
+        layer = QgsVectorLayer(
+            self.shapePath, QFileInfo(self.shapePath).baseName(), 'ogr')
 
         return layer
 
     def _newShapefile(self):
         fields = QgsFields()
-        fields.append(QgsField("filepath", QVariant.String, '', 254))
-        fields.append(QgsField("longitude", QVariant.Double, '', 20, 7))
-        fields.append(QgsField("latitude", QVariant.Double, '', 20, 7))
-        fields.append(QgsField("altitude", QVariant.Double, '', 20, 7))
-        fields.append(QgsField("north", QVariant.String, '', 1))
-        fields.append(QgsField("azimuth", QVariant.Double, '', 20, 7))
-        fields.append(QgsField("gps_date", QVariant.String, '', 254))
-        fields.append(QgsField("img_date", QVariant.String, '', 254))
+        fields.append(QgsField('filepath', QVariant.String, '', 254))
+        fields.append(QgsField('filename', QVariant.String, '', 254))
+        fields.append(QgsField('longitude', QVariant.Double, '', 20, 7))
+        fields.append(QgsField('latitude', QVariant.Double, '', 20, 7))
+        fields.append(QgsField('altitude', QVariant.Double, '', 20, 7))
+        fields.append(QgsField('north', QVariant.String, '', 1))
+        fields.append(QgsField('azimuth', QVariant.Double, '', 20, 7))
+        fields.append(QgsField('gpsDate', QVariant.String, '', 254))
+        fields.append(QgsField('imgDate', QVariant.String, '', 254))
+        fields.append(QgsField('userLabel', QVariant.String, '', 254))
 
         crs = QgsCoordinateReferenceSystem(4326)
         writer = QgsVectorFileWriter(
-            self.shapePath, self.encoding, fields, QgsWkbTypes.PointZ, crs, driverName="ESRI Shapefile")
+            self.shapePath, self.encoding, fields, QGis.WKBPoint, crs)
         del writer
 
-        layer = QgsVectorLayer(self.shapePath, self.fileName, "ogr")
+        layer = QgsVectorLayer(
+            self.shapePath, QFileInfo(self.shapePath).baseName(), 'ogr')
 
         return layer
 
     def _extractCoordinates(self, tags):
         # Some devices (e.g. with Android 1.6) write tags in non standard
         # way as decimal degrees in ASCII field
-        dataType = tags["GPS GPSLongitude"].field_type
+        dataType = tags['GPS GPSLongitude'].field_type
         typeName = exifread.tags.FIELD_TYPES[dataType][2]
-        if typeName == "ASCII":
-            lon = round(float(tags["GPS GPSLongitude"].values), 7)
-            lat = round(float(tags["GPS GPSLatitude"].values), 7)
+        if typeName == 'ASCII':
+            lon = round(float(tags['GPS GPSLongitude'].values), 7)
+            lat = round(float(tags['GPS GPSLatitude'].values), 7)
             return lon, lat
 
         # Sometimes tags present but filled with zeros
-        if tags["GPS GPSLongitude"].printable == "[0/0, 0/0, 0/0]":
+        if tags['GPS GPSLongitude'].printable == '[0/0, 0/0, 0/0]':
             return None, None
 
         # Longitude direction will be either "E" or "W"
-        lonDirection = tags["GPS GPSLongitudeRef"].printable
+        lonDirection = tags['GPS GPSLongitudeRef'].printable
         # Coordinates stored as list of degrees, minutes and seconds
-        v = tags["GPS GPSLongitude"].values
+        v = tags['GPS GPSLongitude'].values
         ddLon = v[0].num if v[0].den == 1 else (v[0].num * 1.0) / v[0].den
         mmLon = v[1].num if v[1].den == 1 else (v[1].num * 1.0) / v[1].den
         ssLon = v[2].num if v[2].den == 1 else (v[2].num * 1.0) / v[2].den
 
         # Latitude direction will be either "N" or "S"
-        latDirection = tags["GPS GPSLatitudeRef"].printable
+        latDirection = tags['GPS GPSLatitudeRef'].printable
         # Coordinates stored as list of degrees, minutes and seconds
-        v = tags["GPS GPSLatitude"].values
+        v = tags['GPS GPSLatitude'].values
         ddLat = v[0].num if v[0].den == 1 else (v[0].num * 1.0) / v[0].den
         mmLat = v[1].num if v[1].den == 1 else (v[1].num * 1.0) / v[1].den
         ssLat = v[2].num if v[2].den == 1 else (v[2].num * 1.0) / v[2].den
@@ -210,31 +215,31 @@ class PhotoImporter(QObject):
         lat = round(ddLat + mmLat + ssLat, 7)
 
         # Apply direction
-        if lonDirection == "W":
+        if lonDirection == 'W':
             lon = 0 - lon
-        if latDirection == "S":
+        if latDirection == 'S':
             lat = 0 - lat
 
         return lon, lat
 
     def _extractAltitude(self, tags):
-        if "GPS GPSAltitude" not in tags:
+        if 'GPS GPSAltitude' not in tags:
             return None
 
         # Some devices (e.g. with Android 1.6) write tags in non standard
         # way as ASCII field. Also they don't write GPS GPSAltitudeRef tag
-        dataType = tags["GPS GPSAltitude"].field_type
+        dataType = tags['GPS GPSAltitude'].field_type
         typeName = exifread.tags.FIELD_TYPES[dataType][2]
-        if typeName == "ASCII":
-            altitude = tags["GPS GPSAltitude"].values
+        if typeName == 'ASCII':
+            altitude = tags['GPS GPSAltitude'].values
             return round(float(altitude), 7)
 
-        if "GPS GPSAltitudeRef" not in tags:
+        if 'GPS GPSAltitudeRef' not in tags:
             return None
 
         # Reference will be either 0 or 1
-        reference = tags["GPS GPSAltitudeRef"].values[0]
-        v = tags["GPS GPSAltitude"].values[0]
+        reference = tags['GPS GPSAltitudeRef'].values[0]
+        v = tags['GPS GPSAltitude'].values[0]
         if v.num == 0:
             return None
         altitude = float(v.num) if v.den == 1 else (v.num * 1.0) / v.den
@@ -246,44 +251,52 @@ class PhotoImporter(QObject):
         return round(altitude, 7)
 
     def _extractDirection(self, tags):
-        if "GPS GPSImgDirection" not in tags:
+        if 'GPS GPSImgDirection' not in tags:
             return None, None
 
         # Sometimes tag present by filled with zeros
-        if tags["GPS GPSImgDirection"].printable in ["[0/0, 0/0, 0/0]", "0/0"]:
+        if tags['GPS GPSImgDirection'].printable in ['[0/0, 0/0, 0/0]', '0/0']:
             return None, None
 
         # Reference will be either "T" or "M"
-        reference = tags["GPS GPSImgDirectionRef"].values
-        v = tags["GPS GPSImgDirection"].values[0]
+        reference = tags['GPS GPSImgDirectionRef'].values
+        v = tags['GPS GPSImgDirection'].values[0]
         azimuth = float(v.num) if v.den == 1 else (v.num * 1.0) / v.den
 
         return reference, round(azimuth, 7)
 
     def _extracrGPSDateTime(self, tags):
         imgDate = None
-        if "GPS GPSDate" in tags:
-            imgDate = tags["GPS GPSDate"].values
+        if 'GPS GPSDate' in tags:
+            imgDate = tags['GPS GPSDate'].values
 
-        if "GPS GPSTimeStamp" in tags:
+        if 'GPS GPSTimeStamp' in tags:
             # Some devices (e.g. with Android 1.6) write tags in non standard
             # way as ASCII field. Also they don't write GPS GPSDate tag
-            dataType = tags["GPS GPSTimeStamp"].field_type
+            dataType = tags['GPS GPSTimeStamp'].field_type
             typeName = exifread.tags.FIELD_TYPES[dataType][2]
-            if typeName == "ASCII":
-                return tags["GPS GPSTimeStamp"].values
+            if typeName == 'ASCII':
+                return tags['GPS GPSTimeStamp'].printable
             else:
-                v = [str(i) for i in tags["GPS GPSTimeStamp"].values]
-                imgTime = "{:0>2}:{:0>2}:{:0>2}".format(v[0], v[1], v[2])
+                v = tags['GPS GPSTimeStamp'].values
+                imgTime = '{:0>2}:{:0>2}:{:0>2}'.format(v[0], v[1], v[2])
                 if imgDate is None:
                     return imgTime
                 else:
-                    return "{} {}".format(imgDate, imgTime)
+                    return '{} {}'.format(imgDate, imgTime)
 
-        return None
+        return 'not found'
 
     def _extractImageDateTime(self, tags):
-        if "Image DateTime" in tags:
-            return tags["Image DateTime"].values
+        if 'EXIF DateTimeOriginal' in tags:
+            return tags['EXIF DateTimeOriginal'].printable
+
+        return 'not found'
+
+    def _extractUserComment(self, tags):
+        #Get comments
+        if 'EXIF UserComment' in tags:
+            return tags['EXIF UserComment'].printable
 
         return None
+
